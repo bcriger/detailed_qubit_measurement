@@ -1,3 +1,4 @@
+import homodyne_sim as hs
 import JC_utils as jc
 import numpy as np
 import qutip as qt
@@ -20,7 +21,7 @@ g = 2. * np.pi * 50.
 kappa = 2. * np.pi * 5.
 omega_cav = 2. * np.pi * 7400.
 
-n_c = 10 #number of cavity states
+n_c = 30 #number of cavity states
 n_q = 1
 
 plus_state = qt.Qobj( np.ones( (2, 2) ) ) / 2.
@@ -67,6 +68,9 @@ e_lst_sm = [e_lst[0]]
 
 ham_off = rest_ham + jc_ham 
 opts_on = qt.Options(store_final_state=True)
+
+pulse_fun = lambda t, amp: jc.tanh_updown(t, amp, jc.sigma, 5.*jc.sigma, jc.tau/2. + 5. * jc.sigma)
+times = np.linspace(0., jc.tau, jc.steps)
 
 def hi_power_check(amps, test_rhos, check_ops):
     """
@@ -125,7 +129,7 @@ def rabi_check(amps, test_rhos, check_ops):
 
     return big_list
 
-def five_checks(rho_vec):
+def five_checks(rho_input, is_mat=False):
     """
     Calculates the sanity checks for a density matrix:
     + min eigenvalue
@@ -134,11 +138,11 @@ def five_checks(rho_vec):
     + purity
     + deviation from hermiticity
     """
-    rho = jc.vec2mat(rho_vec)
-    herm_dev = np.amax(np.abs(rho - rho.H))
+    rho = rho_input if is_mat else jc.vec2mat(rho_input)
+    herm_dev = np.amax(np.abs(rho - rho.conj().T))
     eigs = scp.linalg.eigvals(rho)
-    output = (np.amin(eigs), np.amax(eigs), sum(eigs),
-                                sum(eigs**2), herm_dev)
+    output = np.array([np.amin(eigs), np.amax(eigs), sum(eigs),
+                                sum(eigs**2), herm_dev])
     return output
 
 def trace_row(dim):
@@ -161,11 +165,9 @@ def sme_trajectories(amps, test_rhos, n_traj):
     
     dim = test_rhos[0].shape[0]
     tr = trace_row(dim).todense()
-    sp_id = scp.sparse.identity(20, format='csr')
+    sp_id = scp.sparse.identity(2**n_q * n_c, format='csr')
     lin_meas_op = scp.sparse.kron(sp_id, a.data.todense()) + \
                     scp.sparse.kron(a.data.conj().todense(), sp_id)
-    
-    times = np.linspace(0., jc.tau, jc.steps)
 
     def det_fun(t, rho):
         return lind_on * rho if (t < jc.tau / 2.) else lind_off * rho
@@ -182,7 +184,7 @@ def sme_trajectories(amps, test_rhos, n_traj):
                             for amp in amps]
     
     for amp_dx, amp in enumerate(amps):
-        pulse_fun = lambda t: jc.tanh_updown(t, amp, jc.sigma, 5.*jc.sigma, jc.tau/2. + 5. * jc.sigma)
+        pls_f = lambda t: pulse_fun(t, amp)
         for rho_dx, test_rho in enumerate(test_rhos):
             rho_init = qt.operator_to_vector(test_rho).data.todense()
             for _ in range(n_traj):
@@ -190,16 +192,34 @@ def sme_trajectories(amps, test_rhos, n_traj):
                 for t_dx, t in enumerate(times[:-1]):
                     t_now, t_fut = t, times[t_dx + 1]
                     dt = t_fut - t_now
-                    mat_now = lind_off + pulse_fun(t_now) * lind_pulse
-                    mat_fut = lind_off + pulse_fun(t_fut) * lind_pulse
+                    mat_now = lind_off + pls_f(t_now) * lind_pulse
+                    mat_fut = lind_off + pls_f(t_fut) * lind_pulse
                     save_data[amp_dx][rho_dx][_].append(five_checks(rho))
                     rho = ss.im_platen_15_step(t, rho, mat_now, mat_fut, stoc_fun,
                                                 dt, np.sqrt(dt) * np.random.randn())
                 save_data[amp_dx][rho_dx][_].append(five_checks(rho))
     return times, save_data
 
+def hs_sim(amp):
+    """
+    Prepares a homodyne_sim.Simulation from global parameters.
+    """
+    app_dict = {'delta': [0.], 'chi': [[g**2 / delta]], 'kappa': [kappa],
+        'gamma_1': [0.], 'gamma_phi': [0.], 'purcell': [[0.]],
+        'omega':[0.], 'eta': 1., 'phi': 0.0}
+    app = hs.Apparatus(**app_dict)
+    return hs.Simulation(app, times, lambda t: pulse_fun(t, amp))
+
+def qubit_only_check():
+    pass
+
 if __name__ == '__main__':
-    # hi_power_list = hi_power_check([10., 20., 30.], [rho0, rho1, dressed_1], [a_dag * a])
+    # hi_power_list = hi_power_check([480.], [dressed_1], [a_dag * a])
     # rabi_list = rabi_check([10., 20., 30.], [rho0, rho1, dressed_1], [a_dag * a])
-    times, sme_list = sme_trajectories([30.], [dressed_1], 1)
+    # times, sme_list = sme_trajectories([480.], [dressed_1], 1)
+    test_sim = hs_sim(16.5)
+    lil_rho = np.array([0., 0., 0., 1.], dtype=np.complex128)
+    test_sim.run(10, lil_rho, lambda *args: five_checks(args[1]), None,
+                            flnm='hs_test.pkl',
+                            check_herm=False, stepper='ip15')
     pass
