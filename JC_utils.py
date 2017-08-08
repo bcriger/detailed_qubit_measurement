@@ -1,5 +1,9 @@
 import qutip as qt, numpy as np
 from scipy.sparse.linalg import expm_multiply
+import scipy as scp
+import scipy.constants as cons
+import sde_solve as ss
+import cProfile as prof
 
 #------------------------------convenience functions------------------#
 def _updown_sigmas(sigma):
@@ -79,16 +83,6 @@ assumptions = ['measurement exactly on resonance with cavity',
 
 #Poletto Surface-7 Params
 
-tau = 0.6
-steps = 2e5
-t_on = 0.02 
-t_off = 0.7
-sigma = 0.01
-
-gamma_1 = (1000. * tau) ** -1. #ridic low, just trying for stability
-gamma_phi = (1000. * tau) ** -1. #ridic low, just trying for stability
-
-
 def tanh_updown(t, e_ss, sigma, t_on, t_off):
     sigma_up, sigma_down = _updown_sigmas(sigma)
     return e_ss / 2. * (np.tanh((t - t_on) / sigma_up) - 
@@ -131,6 +125,79 @@ def on_off_sim(ham_off, pulse_ham, c_lst, amp, init_states,
             out_lst.append(np.vstack([sol_on, sol_off]).copy())
         
     return out_lst
+
+#---------------------------------------------------------------------#
+
+#------------------------other simulation methods---------------------#
+
+def five_checks(rho_input, is_mat=False):
+    """
+    Calculates the sanity checks for a density matrix:
+    + min eigenvalue
+    + max eigenvalue
+    + trace
+    + purity
+    + deviation from hermiticity
+    """
+    rho = rho_input if is_mat else vec2mat(rho_input)
+    herm_dev = np.amax(np.abs(rho - rho.conj().T))
+    eigs = scp.linalg.eigvals(rho)
+    tr = sum(eigs)
+    output = np.array([np.amin(eigs) / tr, np.amax(eigs) / tr, tr / tr,
+                                sum(eigs**2) / tr**2, herm_dev / tr])
+    return output
+
+def expectation_cb(vec_e_ops, rho_vec):
+    dim = int(np.sqrt(rho_vec.shape[0]))
+    tr_rho = sum(rho_vec[_] for _ in range(0, dim ** 2, dim + 1))
+    return [(e_vec * rho_vec) / tr_rho for e_vec in vec_e_ops]
+
+def trace_row(dim):
+    """
+    Returns a vector that, when you take the inner product with a 
+    column-stacked density matrix, gives the trace of that matrix.
+    """
+    data = np.ones(dim)
+    row_ind = np.zeros(dim)
+    col_ind = np.arange(0, dim ** 2, dim + 1)
+    return scp.sparse.csr_matrix((data, (row_ind, col_ind)),
+                                            shape=(1, dim ** 2))
+
+def sme_trajectories(ham_off, pulse_ham, pulse_fun, c_ops, cb_func,
+                        meas_op, rho_init, times, n_traj):
+    """
+    To visualise individual trajectories, and see some quantum
+    jumps/latching/etc., we use sde_solve.
+    """
+
+    lind_off = qt.liouvillian(ham_off, c_ops).data
+    lind_pulse = qt.liouvillian(pulse_ham, []).data
+    
+    dim = int(np.sqrt(rho_init.shape[0]))
+    # tr = trace_row(dim).todense()
+    sp_id = scp.sparse.identity(dim, format='csr')
+    lin_meas_op = scp.sparse.kron(sp_id, meas_op.data) + \
+                    scp.sparse.kron(meas_op.data.conj(), sp_id)
+
+    def stoc_fun(t, rho):
+        return lin_meas_op * rho # linear SME
+
+    save_data = [[] for traj in range(n_traj)]
+
+    for _ in range(n_traj):
+        rho = rho_init.copy()
+        for t_dx, t in enumerate(times[:-1]):
+            t_now, t_fut = t, times[t_dx + 1]
+            dt = t_fut - t_now
+            mat_now = lind_off + pulse_fun(t_now) * lind_pulse
+            mat_fut = lind_off + pulse_fun(t_fut) * lind_pulse
+            save_data[_].append(cb_func(rho))
+            dW = np.sqrt(dt) * np.random.randn()
+            rho = ss.im_platen_15_step(t, rho, mat_now, mat_fut, stoc_fun,
+                                        dt, dW, alpha = 1.)
+        save_data[_].append(cb_func(rho))
+    return save_data
+
 
 #---------------------------------------------------------------------#
 

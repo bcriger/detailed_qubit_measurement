@@ -3,8 +3,7 @@ import JC_utils as jc
 import numpy as np
 import qutip as qt
 import scipy as scp
-import scipy.constants as cons
-import sde_solve as ss
+import cProfile as prof
 
 """
 The purpose of this file is to simulate one-qubit measurement in the
@@ -16,12 +15,21 @@ presence of confounding factors:
  + (maybe) additional qubits coupled to the readout resonator 
 """
 
+tau = 0.6
+steps = 2e4
+t_on = 0.02 
+t_off = 0.7
+sigma = 0.01
+
+gamma_1 = (1000. * tau) ** -1. #ridic low, just trying for stability
+gamma_phi = (1000. * tau) ** -1. #ridic low, just trying for stability
+
 delta = 2. * np.pi * 1600.
 g = 2. * np.pi * 50.
 kappa = 2. * np.pi * 5.
 omega_cav = 2. * np.pi * 7400.
 
-n_c = 30 #number of cavity states
+n_c = 60 #number of cavity states
 n_q = 1
 
 plus_state = qt.Qobj( np.ones( (2, 2) ) ) / 2.
@@ -52,8 +60,7 @@ rho0 = qt.tensor(vacuum, zero_state)
 rho1 = qt.tensor(vacuum, one_state)
 
 # Stueckelberg Angles & Dressed States
-# theta = scp.arctan(-2. * g / delta) / 2.
-theta = scp.arctan(2. * g / delta) / 2. #guess to avoid negative eigenvalue
+theta = scp.arctan(2. * g / delta) / 2.
 dressed_1_ket = scp.cos(theta) * qt.tensor(vacuum_ket, zero_ket) + \
                 scp.sin(theta) * qt.tensor(qt.fock(n_c, 1), one_ket)
 dressed_1 = dressed_1_ket * dressed_1_ket.dag()
@@ -69,157 +76,20 @@ e_lst_sm = [e_lst[0]]
 ham_off = rest_ham + jc_ham 
 opts_on = qt.Options(store_final_state=True)
 
-pulse_fun = lambda t, amp: jc.tanh_updown(t, amp, jc.sigma, 5.*jc.sigma, jc.tau/2. + 5. * jc.sigma)
+pulse_fun = lambda t, amp: jc.tanh_updown(t, amp, jc.sigma,
+                                            5. * jc.sigma,
+                                            jc.tau / 2. + 5. * jc.sigma)
 times = np.linspace(0., jc.tau, jc.steps)
 
-def hi_power_check(amps, test_rhos, check_ops):
-    """
-    This function runs some one-qubit, one-mode ME simulations to look
-    at traces of the qubit 0 and 1
-    """
-    big_list = []
-    
-    for amp in amps:
-        state_histories = jc.on_off_sim(ham_off, pulse_ham, c_lst, amp,
-                                            test_rhos, jc.tau, jc.steps)
-        trace_histories = []
-        
-        for test_rho, state_hist in zip(test_rhos, state_histories):
-            vec_rho = qt.operator_to_vector(test_rho)
-            trace_hist = [np.inner(vec_rho.data.todense().T, state.T)[0,0] for state in state_hist]
-            trace_histories.append(trace_hist)
-
-        for state_hist in state_histories:
-            for op in check_ops:
-                vec_op = qt.operator_to_vector(op)
-                trace_hist = [np.inner(vec_op.data.todense().T, state.T)[0,0] for state in state_hist]
-                trace_histories.append(trace_hist)
-
-        big_list.append(trace_histories)
-
-    return big_list
-
-def rabi_check(amps, test_rhos, check_ops):
-    """
-    Have to use qutip.mesolve, since the Hamiltonian is now
-    time-dependent in the cavity frame. 
-    """
-    big_list = []
-    
-    for amp in amps:
-        state_histories = jc.on_off_sim(rabi_ham, pulse_ham, c_lst, amp,
-                                        test_rhos, jc.tau, jc.steps,
-                                        qutip=True,
-                                        args={'w':omega_cav})
-        trace_histories = []
-        
-        for test_rho, state_hist in zip(test_rhos, state_histories):
-            vec_rho = qt.operator_to_vector(test_rho)
-            trace_hist = [np.inner(vec_rho.data.todense().T, state.T)[0,0] for state in state_hist]
-            trace_histories.append(trace_hist)
-
-        for state_hist in state_histories:
-            for op in check_ops:
-                vec_op = qt.operator_to_vector(op)
-                trace_hist = [np.inner(vec_op.data.todense().T, state.T)[0,0] for state in state_hist]
-                trace_histories.append(trace_hist)
-        
-        big_list.append(trace_histories)
-        # big_list.append(state_histories)
-
-    return big_list
-
-def five_checks(rho_input, is_mat=False):
-    """
-    Calculates the sanity checks for a density matrix:
-    + min eigenvalue
-    + max eigenvalue
-    + trace
-    + purity
-    + deviation from hermiticity
-    """
-    rho = rho_input if is_mat else jc.vec2mat(rho_input)
-    herm_dev = np.amax(np.abs(rho - rho.conj().T))
-    eigs = scp.linalg.eigvals(rho)
-    output = np.array([np.amin(eigs), np.amax(eigs), sum(eigs),
-                                sum(eigs**2), herm_dev])
-    return output
-
-def trace_row(dim):
-    """
-    Returns a vector that, when you take the inner product with a 
-    column-stacked density matrix, gives the trace of that matrix.
-    """
-    data = np.ones(dim)
-    row_ind = np.zeros(dim)
-    col_ind = np.arange(0, dim**2, dim + 1)
-    return scp.sparse.csr_matrix((data, (row_ind, col_ind)), shape=(1, dim**2))
-
-def sme_trajectories(amps, test_rhos, n_traj):
-    """
-    To visualise individual trajectories, and see some quantum
-    jumps/latching/etc., we use sde_solve.
-    """
-    lind_off = qt.liouvillian(ham_off, c_lst).data.todense()
-    lind_pulse = qt.liouvillian(pulse_ham, []).data.todense()
-    
-    dim = test_rhos[0].shape[0]
-    tr = trace_row(dim).todense()
-    sp_id = scp.sparse.identity(2**n_q * n_c, format='csr')
-    lin_meas_op = scp.sparse.kron(sp_id, a.data.todense()) + \
-                    scp.sparse.kron(a.data.conj().todense(), sp_id)
-
-    def det_fun(t, rho):
-        return lind_on * rho if (t < jc.tau / 2.) else lind_off * rho
-
-    def stoc_fun(t, rho):
-        lin_state = lin_meas_op * rho
-        try:
-            return lin_state - (tr * lin_state)[0,0] * rho
-        except IndexError: #correction term is 0
-            return lin_state
-
-    save_data = [[[[] for traj in range(n_traj)]
-                        for rho in test_rhos]
-                            for amp in amps]
-    
-    for amp_dx, amp in enumerate(amps):
-        pls_f = lambda t: pulse_fun(t, amp)
-        for rho_dx, test_rho in enumerate(test_rhos):
-            rho_init = qt.operator_to_vector(test_rho).data.todense()
-            for _ in range(n_traj):
-                rho = rho_init
-                for t_dx, t in enumerate(times[:-1]):
-                    t_now, t_fut = t, times[t_dx + 1]
-                    dt = t_fut - t_now
-                    mat_now = lind_off + pls_f(t_now) * lind_pulse
-                    mat_fut = lind_off + pls_f(t_fut) * lind_pulse
-                    save_data[amp_dx][rho_dx][_].append(five_checks(rho))
-                    rho = ss.im_platen_15_step(t, rho, mat_now, mat_fut, stoc_fun,
-                                                dt, np.sqrt(dt) * np.random.randn())
-                save_data[amp_dx][rho_dx][_].append(five_checks(rho))
-    return times, save_data
-
-def hs_sim(amp):
-    """
-    Prepares a homodyne_sim.Simulation from global parameters.
-    """
-    app_dict = {'delta': [0.], 'chi': [[g**2 / delta]], 'kappa': [kappa],
-        'gamma_1': [0.], 'gamma_phi': [0.], 'purcell': [[0.]],
-        'omega':[0.], 'eta': 1., 'phi': 0.0}
-    app = hs.Apparatus(**app_dict)
-    return hs.Simulation(app, times, lambda t: pulse_fun(t, amp))
-
-def qubit_only_check():
-    pass
-
 if __name__ == '__main__':
-    # hi_power_list = hi_power_check([480.], [dressed_1], [a_dag * a])
-    # rabi_list = rabi_check([10., 20., 30.], [rho0, rho1, dressed_1], [a_dag * a])
-    # times, sme_list = sme_trajectories([480.], [dressed_1], 1)
-    test_sim = hs_sim(16.5)
-    lil_rho = np.array([0., 0., 0., 1.], dtype=np.complex128)
-    test_sim.run(10, lil_rho, lambda *args: five_checks(args[1]), None,
-                            flnm='hs_test.pkl',
-                            check_herm=False, stepper='ip15')
+    e_vecs = [qt.operator_to_vector(e_op).data.H for e_op in e_lst]
+    e_cb = lambda rho: jc.expectation_cb(e_vecs, rho)
+    
+    sim_dict = {'ham_off' : ham_off, 'pulse_ham' : pulse_ham,
+                'pulse_fun': lambda t: pulse_fun(t, 480.), 'c_ops': c_lst,
+                'cb_func': jc.five_checks, 'meas_op': np.sqrt(kappa) * a, 'rho_init': qt.operator_to_vector(dressed_1).data.todense(),
+                'times': times, 'n_traj' : 1}
+
+    sme_list = jc.sme_trajectories(**sim_dict)
+    
     pass
