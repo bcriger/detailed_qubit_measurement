@@ -15,7 +15,9 @@ def _updown_sigmas(sigma):
     return sigma_tpl
 
 eye, x, y, z = qt.identity(2), qt.sigmax(), qt.sigmay(), qt.sigmaz()
-m, p = qt.sigmam(), qt.sigmap()
+
+# Different definition
+p, m = qt.sigmam(), qt.sigmap()
 
 cav_op = lambda op, nq: qt.tensor(op, *(qt.identity(2) for _ in range(nq)))
 
@@ -88,8 +90,16 @@ def tanh_updown(t, e_ss, sigma, t_on, t_off):
     return e_ss / 2. * (np.tanh((t - t_on) / sigma_up) - 
                             np.tanh((t - t_off) / sigma_down))
 
-pulse = lambda t, args: tanh_updown(t, amp, sigma, t_on, t_off) 
-times = np.linspace(0., tau / 2., steps)
+def tanh_updown_dot(t, e_ss, sigma, t_on, t_off):
+    sigma_up, sigma_down = _updown_sigmas(sigma)
+    assert sigma_up == sigma_down
+    sigma = sigma_up
+    shape = np.cosh((t - t_on) / sigma_up) ** -2. -\
+             np.cosh((t - t_off) / sigma_down) ** -2. 
+    return e_ss / (2. * sigma) * shape
+
+# pulse = lambda t, args: tanh_updown(t, amp, sigma, t_on, t_off) 
+# times = np.linspace(0., tau / 2., steps)
 
 #-----------------lil ass simulation method---------------------------#
 
@@ -163,8 +173,9 @@ def trace_row(dim):
     return scp.sparse.csr_matrix((data, (row_ind, col_ind)),
                                             shape=(1, dim ** 2))
 
-def sme_trajectories(ham_off, pulse_ham, pulse_fun, c_ops, cb_func,
-                        meas_op, rho_init, times, n_traj):
+def sme_trajectories(ham_off, pulse_ham, pulse_fun, pulse_dot_fun,
+                        c_ops, cb_func, meas_op, rho_init, times,
+                        n_traj):
     """
     To visualise individual trajectories, and see some quantum
     jumps/latching/etc., we use sde_solve.
@@ -174,15 +185,22 @@ def sme_trajectories(ham_off, pulse_ham, pulse_fun, c_ops, cb_func,
     lind_pulse = qt.liouvillian(pulse_ham, []).data
     
     dim = int(np.sqrt(rho_init.shape[0]))
-    # tr = trace_row(dim).todense()
     sp_id = scp.sparse.identity(dim, format='csr')
     lin_meas_op = scp.sparse.kron(sp_id, meas_op.data) + \
                     scp.sparse.kron(meas_op.data.conj(), sp_id)
+    lin_meas_op_sq = lin_meas_op ** 2
+    l1_lin_meas_op = 0.5 * lin_meas_op_sq # see Jacobs eq 6.17
+
+    def det_fun(t, rho):
+        return (lind_off + pulse_fun(t) * lind_pulse) * rho
 
     def stoc_fun(t, rho):
         return lin_meas_op * rho # linear SME
+    
+    def l1_stoc_fun(t, rho):
+        return l1_lin_meas_op * rho 
 
-    save_data = [[] for traj in range(n_traj)]
+    save_data = [[] for _ in range(n_traj)]
 
     for _ in range(n_traj):
         rho = rho_init.copy()
@@ -191,10 +209,18 @@ def sme_trajectories(ham_off, pulse_ham, pulse_fun, c_ops, cb_func,
             dt = t_fut - t_now
             mat_now = lind_off + pulse_fun(t_now) * lind_pulse
             mat_fut = lind_off + pulse_fun(t_fut) * lind_pulse
+            d_mat_now = pulse_dot_fun(t_now) * lind_pulse
             save_data[_].append(cb_func(rho))
             dW = np.sqrt(dt) * np.random.randn()
             rho = ss.im_platen_15_step(t, rho, mat_now, mat_fut, stoc_fun,
-                                        dt, dW, alpha = 1.)
+                                        dt, dW, alpha = 0.5)
+            # rho = ss.platen_15_step(t, rho, det_fun, stoc_fun, dt, dW)
+            # rho = ss.im_milstein_1_step(t, rho, mat_now, mat_fut,
+                                        # stoc_fun, dt, dW, l1_stoc_fun,
+                                        # alpha=1.)
+            # rho = ss.lin_taylor_15_step(t, rho, mat_now, lin_meas_op,
+            #                             d_mat_now, lin_meas_op_sq,
+            #                             dt, dW)
         save_data[_].append(cb_func(rho))
     return save_data
 
